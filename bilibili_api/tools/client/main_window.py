@@ -4,20 +4,23 @@ Bilibili 第三方客户端主窗口
 
 import sys
 import asyncio
-from typing import Optional
+import random
+from typing import Optional, List
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLineEdit, QPushButton, QListWidget, QListWidgetItem, QLabel,
     QFrame, QScrollArea, QMenuBar, QMenu, QStatusBar, QTabWidget,
     QTextEdit, QProgressBar, QGroupBox, QGridLayout, QMessageBox,
-    QSplitter, QToolBar, QDialog, QComboBox, QSpinBox
+    QSplitter, QToolBar, QDialog, QComboBox, QSpinBox, QSlider
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QByteArray, QUrl
-from PyQt6.QtGui import QPixmap, QFont, QIcon, QAction, QDesktopServices
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QByteArray, QUrl, QPoint, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty
+from PyQt6.QtGui import QPixmap, QFont, QIcon, QAction, QDesktopServices, QPainter, QColor, QPen
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 import bilibili_api
-from bilibili_api import video, search, user, Credential, hot, dynamic, live, favorite_list, comment
+from bilibili_api import video, search, user, Credential, hot, dynamic, live, favorite_list, comment, Danmaku
 from .material_style import MATERIAL_THEME
 
 
@@ -368,6 +371,113 @@ class AllDynamicsWorker(QThread):
             raise e
 
 
+class VideoPlayUrlWorker(QThread):
+    """视频播放地址工作线程"""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    
+    def __init__(self, bvid: str, cid: int, credential: Optional[Credential] = None):
+        super().__init__()
+        self.bvid = bvid
+        self.cid = cid
+        self.credential = credential
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.fetch_play_url())
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_play_url(self):
+        """获取视频播放地址"""
+        try:
+            v = video.Video(bvid=self.bvid, credential=self.credential)
+            # 获取视频下载/播放URL
+            play_info = await v.get_download_url(cid=self.cid)
+            return play_info
+        except Exception as e:
+            raise e
+
+
+class DanmakuWorker(QThread):
+    """弹幕工作线程"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+    
+    def __init__(self, bvid: str, cid: int, credential: Optional[Credential] = None):
+        super().__init__()
+        self.bvid = bvid
+        self.cid = cid
+        self.credential = credential
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.fetch_danmakus())
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_danmakus(self):
+        """获取弹幕"""
+        try:
+            v = video.Video(bvid=self.bvid, credential=self.credential)
+            # 获取弹幕列表
+            danmakus = await v.get_danmakus(cid=self.cid)
+            return danmakus
+        except Exception as e:
+            raise e
+
+
+class DanmakuLabel(QLabel):
+    """弹幕标签组件"""
+    
+    def __init__(self, text: str, color: QColor, parent=None):
+        super().__init__(text, parent)
+        self.setStyleSheet(f"""
+            QLabel {{
+                color: {color.name()};
+                background-color: transparent;
+                font-size: 20px;
+                font-weight: bold;
+                padding: 2px 5px;
+            }}
+        """)
+        # 设置文字描边效果
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+    def paintEvent(self, event):
+        """绘制带描边的文字"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # 绘制黑色描边
+        pen = QPen(QColor(0, 0, 0, 200))
+        pen.setWidth(3)
+        painter.setPen(pen)
+        painter.setFont(self.font())
+        
+        rect = self.rect()
+        # 绘制多次形成描边效果
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx != 0 or dy != 0:
+                    painter.drawText(rect.adjusted(dx, dy, dx, dy), Qt.AlignmentFlag.AlignLeft, self.text())
+        
+        # 绘制主文字
+        color = self.palette().color(self.foregroundRole())
+        painter.setPen(color)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignLeft, self.text())
+
+
 class LoginDialog(QWidget):
     """登录对话框"""
     
@@ -451,9 +561,10 @@ class LoginDialog(QWidget):
 class VideoDetailDialog(QDialog):
     """视频详情对话框"""
     
-    def __init__(self, video_info: dict, parent=None):
+    def __init__(self, video_info: dict, credential: Optional[Credential] = None, parent=None):
         super().__init__(parent)
         self.video_info = video_info
+        self.credential = credential
         self.setupUI()
         
     def setupUI(self):
@@ -527,6 +638,12 @@ class VideoDetailDialog(QDialog):
         # 按钮组
         button_layout = QHBoxLayout()
         
+        # 播放视频按钮
+        play_btn = QPushButton("▶ 播放视频（带弹幕）")
+        play_btn.clicked.connect(self.play_video)
+        play_btn.setStyleSheet("background-color: #f25d8e; color: white; font-weight: bold; padding: 8px;")
+        button_layout.addWidget(play_btn)
+        
         # 在浏览器打开
         open_browser_btn = QPushButton("在浏览器中打开")
         open_browser_btn.clicked.connect(self.open_in_browser)
@@ -563,6 +680,16 @@ class VideoDetailDialog(QDialog):
             minutes = minutes % 60
             return f"{hours}:{minutes:02d}:{secs:02d}"
         return f"{minutes}:{secs:02d}"
+    
+    def play_video(self):
+        """播放视频"""
+        bvid = self.video_info.get('bvid', '')
+        if bvid:
+            # 打开视频播放器对话框
+            player = VideoPlayerDialog(self.video_info, self.credential, self)
+            player.exec()
+        else:
+            QMessageBox.warning(self, "提示", "无法获取视频信息")
         
     def open_in_browser(self):
         """在浏览器中打开"""
@@ -848,6 +975,366 @@ class UserInfoWorker(QThread):
         try:
             u = user.User(uid=self.uid, credential=self.credential)
             info = await u.get_user_info()
+            return info
+        except Exception as e:
+            raise e
+
+
+class VideoPlayerDialog(QDialog):
+    """视频播放器对话框（带弹幕）"""
+    
+    def __init__(self, video_info: dict, credential: Optional[Credential] = None, parent=None):
+        super().__init__(parent)
+        self.video_info = video_info
+        self.credential = credential
+        self.bvid = video_info.get('bvid', '')
+        self.cid = 0
+        self.danmakus = []
+        self.danmaku_labels = []
+        self.current_time = 0
+        self.is_playing = False
+        
+        self.setupUI()
+        self.loadVideoInfo()
+        
+    def setupUI(self):
+        """设置UI"""
+        self.setWindowTitle(f"播放: {self.video_info.get('title', '视频')}")
+        self.setMinimumSize(960, 600)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 视频播放容器
+        video_container = QWidget()
+        video_container.setStyleSheet("background-color: #000;")
+        video_layout = QVBoxLayout(video_container)
+        video_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 视频播放器
+        self.video_widget = QVideoWidget()
+        self.media_player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.setVideoOutput(self.video_widget)
+        
+        # 弹幕容器（覆盖在视频上方）
+        self.danmaku_container = QWidget(self.video_widget)
+        self.danmaku_container.setStyleSheet("background-color: transparent;")
+        self.danmaku_container.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        
+        video_layout.addWidget(self.video_widget)
+        
+        # 控制栏
+        controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(10, 5, 10, 5)
+        
+        # 播放/暂停按钮
+        self.play_button = QPushButton("播放")
+        self.play_button.setMaximumWidth(80)
+        self.play_button.clicked.connect(self.togglePlayPause)
+        controls_layout.addWidget(self.play_button)
+        
+        # 进度条
+        self.progress_slider = QSlider(Qt.Orientation.Horizontal)
+        self.progress_slider.setRange(0, 1000)
+        self.progress_slider.sliderMoved.connect(self.seek)
+        controls_layout.addWidget(self.progress_slider)
+        
+        # 时间标签
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setMinimumWidth(100)
+        controls_layout.addWidget(self.time_label)
+        
+        # 音量控制
+        volume_label = QLabel("音量:")
+        controls_layout.addWidget(volume_label)
+        
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(50)
+        self.volume_slider.setMaximumWidth(100)
+        self.volume_slider.valueChanged.connect(self.setVolume)
+        controls_layout.addWidget(self.volume_slider)
+        
+        # 弹幕开关
+        self.danmaku_checkbox = QPushButton("弹幕:开")
+        self.danmaku_checkbox.setCheckable(True)
+        self.danmaku_checkbox.setChecked(True)
+        self.danmaku_checkbox.setMaximumWidth(80)
+        self.danmaku_checkbox.clicked.connect(self.toggleDanmaku)
+        controls_layout.addWidget(self.danmaku_checkbox)
+        
+        video_layout.addLayout(controls_layout)
+        
+        # 信息区域
+        info_layout = QHBoxLayout()
+        
+        # 状态标签
+        self.status_label = QLabel("正在加载视频...")
+        info_layout.addWidget(self.status_label)
+        
+        info_layout.addStretch()
+        
+        # 关闭按钮
+        close_btn = QPushButton("关闭")
+        close_btn.setMaximumWidth(80)
+        close_btn.clicked.connect(self.close)
+        info_layout.addWidget(close_btn)
+        
+        layout.addWidget(video_container)
+        layout.addLayout(info_layout)
+        
+        # 连接媒体播放器信号
+        self.media_player.positionChanged.connect(self.updatePosition)
+        self.media_player.durationChanged.connect(self.updateDuration)
+        self.media_player.playbackStateChanged.connect(self.onPlaybackStateChanged)
+        
+        # 弹幕定时器
+        self.danmaku_timer = QTimer()
+        self.danmaku_timer.timeout.connect(self.updateDanmaku)
+        self.danmaku_timer.start(100)  # 每100ms更新一次弹幕
+        
+    def loadVideoInfo(self):
+        """加载视频信息"""
+        # 首先获取CID
+        worker = VideoInfoWorker(self.bvid, self.credential)
+        worker.finished.connect(self.onVideoInfoLoaded)
+        worker.error.connect(self.onVideoInfoError)
+        worker.start()
+        
+        self.video_info_worker = worker
+        
+    def onVideoInfoLoaded(self, info: dict):
+        """视频信息加载完成"""
+        # 获取第一个分P的CID
+        pages = info.get('pages', [])
+        if pages:
+            self.cid = pages[0].get('cid', 0)
+            
+            # 加载播放地址
+            self.loadPlayUrl()
+            
+            # 加载弹幕
+            self.loadDanmakus()
+        else:
+            self.status_label.setText("无法获取视频信息")
+            
+    def onVideoInfoError(self, error: str):
+        """视频信息加载失败"""
+        self.status_label.setText(f"加载失败: {error}")
+        QMessageBox.critical(self, "错误", f"加载视频信息失败: {error}")
+        
+    def loadPlayUrl(self):
+        """加载播放地址"""
+        self.status_label.setText("正在获取播放地址...")
+        
+        worker = VideoPlayUrlWorker(self.bvid, self.cid, self.credential)
+        worker.finished.connect(self.onPlayUrlLoaded)
+        worker.error.connect(self.onPlayUrlError)
+        worker.start()
+        
+        self.play_url_worker = worker
+        
+    def onPlayUrlLoaded(self, play_info: dict):
+        """播放地址加载完成"""
+        try:
+            # 尝试获取播放URL
+            durl = play_info.get('durl', [])
+            if durl:
+                url = durl[0].get('url', '')
+                if url:
+                    self.media_player.setSource(QUrl(url))
+                    self.status_label.setText("准备就绪，点击播放")
+                    return
+            
+            # 尝试dash格式
+            dash = play_info.get('dash', {})
+            video_list = dash.get('video', [])
+            if video_list:
+                url = video_list[0].get('baseUrl', '') or video_list[0].get('base_url', '')
+                if url:
+                    self.media_player.setSource(QUrl(url))
+                    self.status_label.setText("准备就绪，点击播放")
+                    return
+            
+            self.status_label.setText("无法获取播放地址")
+            QMessageBox.warning(self, "提示", "该视频可能需要大会员权限或其他原因无法播放。建议在浏览器中打开。")
+        except Exception as e:
+            self.status_label.setText(f"解析播放地址失败: {str(e)}")
+            
+    def onPlayUrlError(self, error: str):
+        """播放地址加载失败"""
+        self.status_label.setText(f"获取播放地址失败: {error}")
+        QMessageBox.critical(self, "错误", f"获取播放地址失败: {error}\n\n建议在浏览器中打开观看。")
+        
+    def loadDanmakus(self):
+        """加载弹幕"""
+        worker = DanmakuWorker(self.bvid, self.cid, self.credential)
+        worker.finished.connect(self.onDanmakusLoaded)
+        worker.error.connect(lambda e: print(f"加载弹幕失败: {e}"))
+        worker.start()
+        
+        self.danmaku_worker = worker
+        
+    def onDanmakusLoaded(self, danmakus: list):
+        """弹幕加载完成"""
+        self.danmakus = danmakus
+        print(f"已加载 {len(danmakus)} 条弹幕")
+        
+    def togglePlayPause(self):
+        """切换播放/暂停"""
+        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.media_player.pause()
+        else:
+            self.media_player.play()
+            
+    def onPlaybackStateChanged(self, state):
+        """播放状态改变"""
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.play_button.setText("暂停")
+            self.is_playing = True
+        else:
+            self.play_button.setText("播放")
+            self.is_playing = False
+            
+    def updatePosition(self, position):
+        """更新播放位置"""
+        self.current_time = position / 1000.0  # 转换为秒
+        
+        # 更新进度条
+        if self.media_player.duration() > 0:
+            self.progress_slider.setValue(int(position / self.media_player.duration() * 1000))
+        
+        # 更新时间显示
+        current = self.formatTime(position // 1000)
+        total = self.formatTime(self.media_player.duration() // 1000)
+        self.time_label.setText(f"{current} / {total}")
+        
+    def updateDuration(self, duration):
+        """更新总时长"""
+        pass
+        
+    def seek(self, position):
+        """跳转到指定位置"""
+        if self.media_player.duration() > 0:
+            target = int(position / 1000 * self.media_player.duration())
+            self.media_player.setPosition(target)
+            
+    def setVolume(self, value):
+        """设置音量"""
+        self.audio_output.setVolume(value / 100.0)
+        
+    def toggleDanmaku(self):
+        """切换弹幕显示"""
+        if self.danmaku_checkbox.isChecked():
+            self.danmaku_checkbox.setText("弹幕:开")
+        else:
+            self.danmaku_checkbox.setText("弹幕:关")
+            # 清除当前弹幕
+            for label in self.danmaku_labels:
+                label.deleteLater()
+            self.danmaku_labels.clear()
+            
+    def updateDanmaku(self):
+        """更新弹幕显示"""
+        if not self.is_playing or not self.danmaku_checkbox.isChecked():
+            return
+            
+        # 查找当前时间应该显示的弹幕
+        for danmaku in self.danmakus:
+            dm_time = danmaku.dm_time
+            # 允许50ms的误差
+            if abs(dm_time - self.current_time) < 0.5:
+                # 创建弹幕标签
+                self.createDanmakuLabel(danmaku)
+        
+        # 清理已经移出屏幕的弹幕
+        for label in self.danmaku_labels[:]:
+            if label.x() + label.width() < 0:
+                label.deleteLater()
+                self.danmaku_labels.remove(label)
+                
+    def createDanmakuLabel(self, danmaku: Danmaku):
+        """创建弹幕标签"""
+        # 弹幕颜色
+        color = QColor(danmaku.color) if hasattr(danmaku, 'color') else QColor(255, 255, 255)
+        
+        # 创建标签
+        label = DanmakuLabel(danmaku.text, color, self.danmaku_container)
+        label.adjustSize()
+        
+        # 随机Y位置
+        container_height = self.danmaku_container.height()
+        if container_height > 0:
+            y = random.randint(0, max(0, container_height - label.height() - 50))
+        else:
+            y = random.randint(0, 400)
+        
+        # 初始位置在右边屏幕外
+        x = self.danmaku_container.width()
+        label.move(x, y)
+        label.show()
+        
+        self.danmaku_labels.append(label)
+        
+        # 创建动画
+        animation = QPropertyAnimation(label, b"pos")
+        animation.setDuration(8000)  # 8秒划过屏幕
+        animation.setStartValue(QPoint(x, y))
+        animation.setEndValue(QPoint(-label.width(), y))
+        animation.setEasingCurve(QEasingCurve.Type.Linear)
+        animation.start()
+        
+        # 保存动画引用避免被垃圾回收
+        label.animation = animation
+        
+    def resizeEvent(self, event):
+        """窗口大小改变"""
+        super().resizeEvent(event)
+        # 调整弹幕容器大小
+        if hasattr(self, 'danmaku_container'):
+            self.danmaku_container.resize(self.video_widget.size())
+            
+    def formatTime(self, seconds):
+        """格式化时间"""
+        minutes = seconds // 60
+        secs = seconds % 60
+        return f"{minutes:02d}:{secs:02d}"
+        
+    def closeEvent(self, event):
+        """关闭事件"""
+        self.media_player.stop()
+        self.danmaku_timer.stop()
+        super().closeEvent(event)
+
+
+class VideoInfoWorker(QThread):
+    """视频信息工作线程（用于获取CID）"""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    
+    def __init__(self, bvid: str, credential: Optional[Credential] = None):
+        super().__init__()
+        self.bvid = bvid
+        self.credential = credential
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.fetch_info())
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_info(self):
+        """获取视频信息"""
+        try:
+            v = video.Video(bvid=self.bvid, credential=self.credential)
+            info = await v.get_info()
             return info
         except Exception as e:
             raise e
@@ -1338,8 +1825,8 @@ class BilibiliClient(QMainWindow):
                     pass
         
         if bvid:
-            # 显示视频详情对话框
-            dialog = VideoDetailDialog(video_info, self)
+            # 显示视频详情对话框，传递凭据
+            dialog = VideoDetailDialog(video_info, self.credential, self)
             dialog.exec()
         else:
             QMessageBox.information(self, "提示", "无法获取视频信息")
