@@ -10,56 +10,107 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QListWidget, QListWidgetItem, QLabel,
     QFrame, QScrollArea, QMenuBar, QMenu, QStatusBar, QTabWidget,
     QTextEdit, QProgressBar, QGroupBox, QGridLayout, QMessageBox,
-    QSplitter, QToolBar
+    QSplitter, QToolBar, QDialog, QComboBox, QSpinBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QPixmap, QFont, QIcon, QAction
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QByteArray, QUrl
+from PyQt6.QtGui import QPixmap, QFont, QIcon, QAction, QDesktopServices
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 import bilibili_api
-from bilibili_api import video, search, user, Credential
+from bilibili_api import video, search, user, Credential, hot, dynamic, live, favorite_list, comment
 from .material_style import MATERIAL_THEME
+
+
+class ImageLoader(QLabel):
+    """异步图片加载器"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.manager = QNetworkAccessManager()
+        self.manager.finished.connect(self.on_image_loaded)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setText("加载中...")
+        
+    def load_url(self, url: str):
+        """从URL加载图片"""
+        if url:
+            request = QNetworkRequest(QUrl(url))
+            self.manager.get(request)
+    
+    def on_image_loaded(self, reply: QNetworkReply):
+        """图片加载完成"""
+        if reply.error() == QNetworkReply.NetworkError.NoError:
+            data = reply.readAll()
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            if not pixmap.isNull():
+                scaled_pixmap = pixmap.scaled(
+                    self.size(), 
+                    Qt.AspectRatioMode.KeepAspectRatio, 
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                self.setPixmap(scaled_pixmap)
+            else:
+                self.setText("加载失败")
+        else:
+            self.setText("加载失败")
+        reply.deleteLater()
 
 
 class VideoCard(QFrame):
     """视频卡片组件"""
     
+    clicked = pyqtSignal(dict)  # 添加点击信号
+    
     def __init__(self, video_info: dict):
         super().__init__()
         self.video_info = video_info
         self.setupUI()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         
     def setupUI(self):
         self.setObjectName("videoCard")
-        self.setFixedSize(300, 200)
+        self.setFixedSize(300, 280)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
+        
+        # 视频封面
+        self.thumbnail = ImageLoader(self)
+        self.thumbnail.setFixedSize(276, 155)
+        self.thumbnail.setStyleSheet("background-color: #e0e0e0; border-radius: 4px;")
+        
+        # 加载封面图片
+        pic_url = self.video_info.get('pic', '') or self.video_info.get('cover', '')
+        if pic_url:
+            # 添加 https: 如果URL以 // 开头
+            if pic_url.startswith('//'):
+                pic_url = 'https:' + pic_url
+            self.thumbnail.load_url(pic_url)
         
         # 视频标题
         title_label = QLabel(self.video_info.get('title', '无标题'))
         title_label.setObjectName("titleLabel")
         title_label.setWordWrap(True)
-        title_label.setMaximumHeight(60)
+        title_label.setMaximumHeight(45)
+        title_label.setStyleSheet("font-size: 14px; font-weight: 500;")
         
         # UP主信息
-        author_label = QLabel(f"UP主: {self.video_info.get('owner', {}).get('name', '未知')}")
+        author_name = self.video_info.get('owner', {}).get('name', '') or self.video_info.get('author', '未知')
+        author_label = QLabel(f"UP主: {author_name}")
         author_label.setObjectName("subtitleLabel")
         
         # 播放信息
-        view_count = self.video_info.get('stat', {}).get('view', 0)
+        view_count = self.video_info.get('stat', {}).get('view', 0) or self.video_info.get('play', 0)
         like_count = self.video_info.get('stat', {}).get('like', 0)
         
-        stats_label = QLabel(f"播放: {self.format_count(view_count)} | 点赞: {self.format_count(like_count)}")
+        stats_label = QLabel(f"▶ {self.format_count(view_count)} | 👍 {self.format_count(like_count)}")
         stats_label.setObjectName("subtitleLabel")
         
-        # BVID信息
-        bvid_label = QLabel(self.video_info.get('bvid', ''))
-        bvid_label.setObjectName("subtitleLabel")
-        
+        layout.addWidget(self.thumbnail)
         layout.addWidget(title_label)
         layout.addWidget(author_label)
         layout.addWidget(stats_label)
-        layout.addWidget(bvid_label)
         layout.addStretch()
         
     def format_count(self, count: int) -> str:
@@ -71,10 +122,7 @@ class VideoCard(QFrame):
     def mousePressEvent(self, event):
         """鼠标点击事件"""
         if event.button() == Qt.MouseButton.LeftButton:
-            bvid = self.video_info.get('bvid', '')
-            if bvid:
-                print(f"点击了视频: {bvid}")
-                # 这里可以添加播放视频的逻辑
+            self.clicked.emit(self.video_info)
         super().mousePressEvent(event)
 
 
@@ -117,8 +165,160 @@ class SearchWorker(QThread):
             raise e
 
 
+class HotVideosWorker(QThread):
+    """热门视频工作线程"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(self.fetch_hot_videos())
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_hot_videos(self):
+        """获取热门视频"""
+        try:
+            hot_videos = await hot.get_hot_videos()
+            return hot_videos.get('list', [])
+        except Exception as e:
+            raise e
+
+
+class RecommendVideosWorker(QThread):
+    """推荐视频工作线程"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(self.fetch_recommend_videos())
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_recommend_videos(self):
+        """获取推荐视频"""
+        try:
+            from bilibili_api import homepage
+            recommend_data = await homepage.get_videos()
+            return recommend_data.get('item', [])
+        except Exception as e:
+            raise e
+
+
+class VideoDetailWorker(QThread):
+    """视频详情工作线程"""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    
+    def __init__(self, bvid: str, credential: Optional[Credential] = None):
+        super().__init__()
+        self.bvid = bvid
+        self.credential = credential
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.fetch_video_detail())
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_video_detail(self):
+        """获取视频详情"""
+        try:
+            v = video.Video(bvid=self.bvid, credential=self.credential)
+            info = await v.get_info()
+            return info
+        except Exception as e:
+            raise e
+
+
+class LiveRoomsWorker(QThread):
+    """直播间工作线程"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(self.fetch_live_rooms())
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_live_rooms(self):
+        """获取推荐直播间"""
+        try:
+            from bilibili_api import live_area
+            # 获取全部分区的推荐直播间
+            rooms = await live_area.get_list_by_area(area_id=0, page=1)
+            return rooms.get('list', [])
+        except Exception as e:
+            raise e
+
+
+class UserDynamicsWorker(QThread):
+    """用户动态工作线程"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+    
+    def __init__(self, uid: int, credential: Optional[Credential] = None):
+        super().__init__()
+        self.uid = uid
+        self.credential = credential
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(self.fetch_dynamics())
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_dynamics(self):
+        """获取用户动态"""
+        try:
+            u = user.User(uid=self.uid, credential=self.credential)
+            dynamics_data = await u.get_dynamics()
+            items = dynamics_data.get('items', [])
+            return items
+        except Exception as e:
+            raise e
+
+
 class LoginDialog(QWidget):
     """登录对话框"""
+    
+    login_success = pyqtSignal(Credential)
     
     def __init__(self):
         super().__init__()
@@ -126,7 +326,7 @@ class LoginDialog(QWidget):
         
     def setupUI(self):
         self.setWindowTitle("Bilibili 登录")
-        self.setFixedSize(400, 300)
+        self.setFixedSize(450, 350)
         
         layout = QVBoxLayout(self)
         
@@ -148,7 +348,8 @@ class LoginDialog(QWidget):
 
 注意：请勿泄露这些信息给他人！
         """)
-        info_text.setMaximumHeight(120)
+        info_text.setReadOnly(True)
+        info_text.setMaximumHeight(140)
         
         # 输入框
         self.sessdata_edit = QLineEdit()
@@ -187,11 +388,209 @@ class LoginDialog(QWidget):
                 bili_jct=bili_jct,
                 buvid3=buvid3
             )
-            # 这里应该验证凭据有效性，简化处理直接接受
+            self.login_success.emit(credential)
             QMessageBox.information(self, "成功", "登录信息已保存")
             self.close()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"登录失败: {str(e)}")
+
+
+class VideoDetailDialog(QDialog):
+    """视频详情对话框"""
+    
+    def __init__(self, video_info: dict, parent=None):
+        super().__init__(parent)
+        self.video_info = video_info
+        self.setupUI()
+        
+    def setupUI(self):
+        self.setWindowTitle("视频详情")
+        self.setMinimumSize(700, 600)
+        
+        layout = QVBoxLayout(self)
+        
+        # 滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        
+        # 视频封面
+        cover_label = ImageLoader()
+        cover_label.setFixedSize(640, 360)
+        cover_label.setStyleSheet("background-color: #000; border-radius: 4px;")
+        pic_url = self.video_info.get('pic', '')
+        if pic_url and pic_url.startswith('//'):
+            pic_url = 'https:' + pic_url
+        if pic_url:
+            cover_label.load_url(pic_url)
+        content_layout.addWidget(cover_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # 标题
+        title = QLabel(self.video_info.get('title', '无标题'))
+        title.setObjectName("titleLabel")
+        title.setWordWrap(True)
+        title.setStyleSheet("font-size: 18px; font-weight: bold; margin: 10px 0;")
+        content_layout.addWidget(title)
+        
+        # UP主信息
+        owner = self.video_info.get('owner', {})
+        author_info = QLabel(f"UP主: {owner.get('name', '未知')} (uid: {owner.get('mid', 'N/A')})")
+        author_info.setObjectName("subtitleLabel")
+        content_layout.addWidget(author_info)
+        
+        # 统计信息
+        stat = self.video_info.get('stat', {})
+        stats_text = f"""
+        观看: {self.format_count(stat.get('view', 0))} | 
+        点赞: {self.format_count(stat.get('like', 0))} | 
+        投币: {self.format_count(stat.get('coin', 0))} | 
+        收藏: {self.format_count(stat.get('favorite', 0))} | 
+        弹幕: {self.format_count(stat.get('danmaku', 0))} | 
+        评论: {self.format_count(stat.get('reply', 0))}
+        """
+        stats_label = QLabel(stats_text.strip())
+        stats_label.setWordWrap(True)
+        content_layout.addWidget(stats_label)
+        
+        # BVID和时长
+        bvid = self.video_info.get('bvid', 'N/A')
+        duration = self.video_info.get('duration', 0)
+        info_label = QLabel(f"BVID: {bvid} | 时长: {self.format_duration(duration)}")
+        content_layout.addWidget(info_label)
+        
+        # 简介
+        desc_group = QGroupBox("视频简介")
+        desc_layout = QVBoxLayout(desc_group)
+        desc_text = QTextEdit()
+        desc_text.setPlainText(self.video_info.get('desc', '无简介'))
+        desc_text.setReadOnly(True)
+        desc_text.setMaximumHeight(150)
+        desc_layout.addWidget(desc_text)
+        content_layout.addWidget(desc_group)
+        
+        # 按钮组
+        button_layout = QHBoxLayout()
+        
+        # 在浏览器打开
+        open_browser_btn = QPushButton("在浏览器中打开")
+        open_browser_btn.clicked.connect(self.open_in_browser)
+        button_layout.addWidget(open_browser_btn)
+        
+        # 复制链接
+        copy_link_btn = QPushButton("复制链接")
+        copy_link_btn.clicked.connect(self.copy_link)
+        button_layout.addWidget(copy_link_btn)
+        
+        content_layout.addLayout(button_layout)
+        content_layout.addStretch()
+        
+        scroll_area.setWidget(content_widget)
+        layout.addWidget(scroll_area)
+        
+        # 关闭按钮
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+        
+    def format_count(self, count: int) -> str:
+        """格式化数字显示"""
+        if count >= 10000:
+            return f"{count/10000:.1f}万"
+        return str(count)
+        
+    def format_duration(self, seconds: int) -> str:
+        """格式化时长"""
+        minutes = seconds // 60
+        secs = seconds % 60
+        if minutes >= 60:
+            hours = minutes // 60
+            minutes = minutes % 60
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+        
+    def open_in_browser(self):
+        """在浏览器中打开"""
+        bvid = self.video_info.get('bvid', '')
+        if bvid:
+            url = f"https://www.bilibili.com/video/{bvid}"
+            QDesktopServices.openUrl(QUrl(url))
+            
+    def copy_link(self):
+        """复制链接"""
+        bvid = self.video_info.get('bvid', '')
+        if bvid:
+            url = f"https://www.bilibili.com/video/{bvid}"
+            QApplication.clipboard().setText(url)
+            QMessageBox.information(self, "成功", "链接已复制到剪贴板")
+
+
+class LiveRoomCard(QFrame):
+    """直播间卡片组件"""
+    
+    clicked = pyqtSignal(dict)
+    
+    def __init__(self, room_info: dict):
+        super().__init__()
+        self.room_info = room_info
+        self.setupUI()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+    def setupUI(self):
+        self.setObjectName("videoCard")
+        self.setFixedSize(300, 280)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        
+        # 封面
+        self.cover = ImageLoader(self)
+        self.cover.setFixedSize(276, 155)
+        self.cover.setStyleSheet("background-color: #e0e0e0; border-radius: 4px;")
+        
+        cover_url = self.room_info.get('cover', '') or self.room_info.get('user_cover', '')
+        if cover_url:
+            if cover_url.startswith('//'):
+                cover_url = 'https:' + cover_url
+            self.cover.load_url(cover_url)
+        
+        # 直播间标题
+        title = self.room_info.get('title', '无标题')
+        title_label = QLabel(title)
+        title_label.setObjectName("titleLabel")
+        title_label.setWordWrap(True)
+        title_label.setMaximumHeight(45)
+        title_label.setStyleSheet("font-size: 14px; font-weight: 500;")
+        
+        # 主播信息
+        uname = self.room_info.get('uname', '未知')
+        author_label = QLabel(f"主播: {uname}")
+        author_label.setObjectName("subtitleLabel")
+        
+        # 在线人数
+        online = self.room_info.get('online', 0)
+        stats_label = QLabel(f"👥 在线: {self.format_count(online)}")
+        stats_label.setObjectName("subtitleLabel")
+        
+        layout.addWidget(self.cover)
+        layout.addWidget(title_label)
+        layout.addWidget(author_label)
+        layout.addWidget(stats_label)
+        layout.addStretch()
+        
+    def format_count(self, count: int) -> str:
+        """格式化数字显示"""
+        if count >= 10000:
+            return f"{count/10000:.1f}万"
+        return str(count)
+        
+    def mousePressEvent(self, event):
+        """鼠标点击事件"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.room_info)
+        super().mousePressEvent(event)
 
 
 class BilibiliClient(QMainWindow):
@@ -340,68 +739,119 @@ class BilibiliClient(QMainWindow):
         # 创建选项卡
         self.tab_widget = QTabWidget()
         
-        # 搜索结果选项卡
-        self.search_tab = self.createSearchTab()
-        self.tab_widget.addTab(self.search_tab, "搜索结果")
-        
         # 推荐视频选项卡
-        self.recommend_tab = self.createRecommendTab()
-        self.tab_widget.addTab(self.recommend_tab, "推荐")
+        self.recommend_tab = self.createVideoGridTab("推荐")
+        self.tab_widget.addTab(self.recommend_tab, "🏠 推荐")
+        
+        # 热门视频选项卡
+        self.hot_tab = self.createVideoGridTab("热门")
+        self.tab_widget.addTab(self.hot_tab, "🔥 热门")
+        
+        # 搜索结果选项卡
+        self.search_tab = self.createVideoGridTab("搜索结果")
+        self.tab_widget.addTab(self.search_tab, "🔍 搜索")
+        
+        # 直播选项卡
+        self.live_tab = self.createVideoGridTab("直播")
+        self.tab_widget.addTab(self.live_tab, "📺 直播")
         
         layout.addWidget(self.tab_widget)
         
+        # 自动加载推荐内容
+        QTimer.singleShot(500, self.loadRecommendVideos)
+        
         return main_content
         
-    def createSearchTab(self):
-        """创建搜索结果选项卡"""
+    def createVideoGridTab(self, tab_name: str):
+        """创建视频网格布局选项卡"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # 搜索结果标题
-        self.search_title = QLabel("搜索结果")
-        self.search_title.setObjectName("titleLabel")
-        layout.addWidget(self.search_title)
+        # 标题和进度条容器
+        header_layout = QHBoxLayout()
+        
+        # 标题
+        title = QLabel(tab_name)
+        title.setObjectName("titleLabel")
+        header_layout.addWidget(title)
+        
+        header_layout.addStretch()
+        
+        # 刷新按钮
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.setMaximumWidth(80)
+        refresh_btn.clicked.connect(lambda: self.refreshTab(tab_name))
+        header_layout.addWidget(refresh_btn)
+        
+        layout.addLayout(header_layout)
         
         # 进度条
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        progress_bar = QProgressBar()
+        progress_bar.setVisible(False)
+        progress_bar.setObjectName(f"{tab_name}_progress")
+        layout.addWidget(progress_bar)
         
-        # 搜索结果滚动区域
+        # 滚动区域
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         
-        self.search_content = QWidget()
-        self.search_layout = QGridLayout(self.search_content)
-        self.search_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        content_widget = QWidget()
+        grid_layout = QGridLayout(content_widget)
+        grid_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        grid_layout.setObjectName(f"{tab_name}_grid")
         
-        scroll_area.setWidget(self.search_content)
+        scroll_area.setWidget(content_widget)
         layout.addWidget(scroll_area)
         
-        return tab
-        
-    def createRecommendTab(self):
-        """创建推荐选项卡"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        
-        title = QLabel("推荐内容")
-        title.setObjectName("titleLabel")
-        layout.addWidget(title)
-        
-        info = QLabel("推荐功能正在开发中...")
-        info.setObjectName("subtitleLabel")
-        layout.addWidget(info)
-        
-        layout.addStretch()
+        # 保存引用
+        setattr(self, f"{tab_name}_title", title)
+        setattr(self, f"{tab_name}_progress", progress_bar)
+        setattr(self, f"{tab_name}_grid", grid_layout)
+        setattr(self, f"{tab_name}_content", content_widget)
         
         return tab
         
     def setupStyle(self):
         """应用Material Design样式"""
         self.setStyleSheet(MATERIAL_THEME)
+    
+    def clearGrid(self, grid_layout):
+        """清空网格布局"""
+        for i in reversed(range(grid_layout.count())):
+            item = grid_layout.itemAt(i)
+            if item:
+                widget = item.widget()
+                if widget:
+                    widget.setParent(None)
+    
+    def displayVideosInGrid(self, videos: list, grid_layout, is_live=False):
+        """在网格中显示视频"""
+        row, col = 0, 0
+        max_cols = 3  # 每行最多3个卡片
         
+        for video_info in videos:
+            try:
+                if is_live:
+                    card = LiveRoomCard(video_info)
+                    card.clicked.connect(self.onLiveRoomClicked)
+                else:
+                    if 'bvid' in video_info or 'id' in video_info or 'aid' in video_info:
+                        card = VideoCard(video_info)
+                        card.clicked.connect(self.onVideoCardClicked)
+                    else:
+                        continue
+                
+                grid_layout.addWidget(card, row, col)
+                
+                col += 1
+                if col >= max_cols:
+                    col = 0
+                    row += 1
+            except Exception as e:
+                print(f"创建卡片失败: {e}")
+                continue
+    
     def search(self):
         """执行搜索"""
         keyword = self.search_edit.text().strip()
@@ -409,63 +859,187 @@ class BilibiliClient(QMainWindow):
             return
             
         # 显示进度条
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # 无限进度条
+        progress = getattr(self, "搜索结果_progress")
+        progress.setVisible(True)
+        progress.setRange(0, 0)
         self.statusBar().showMessage(f"正在搜索: {keyword}")
         
         # 清空之前的搜索结果
-        self.clearSearchResults()
+        grid = getattr(self, "搜索结果_grid")
+        self.clearGrid(grid)
         
         # 创建搜索工作线程
         self.search_worker = SearchWorker(keyword)
-        self.search_worker.search_finished.connect(self.onSearchFinished)
+        self.search_worker.search_finished.connect(lambda results: self.onSearchFinished(results, keyword))
         self.search_worker.search_error.connect(self.onSearchError)
         self.search_worker.start()
         
-    def clearSearchResults(self):
-        """清空搜索结果"""
-        for i in reversed(range(self.search_layout.count())):
-            item = self.search_layout.itemAt(i)
-            if item:
-                widget = item.widget()
-                if widget:
-                    widget.setParent(None)
-                    
-    def onSearchFinished(self, results: list):
+    def onSearchFinished(self, results: list, keyword: str):
         """搜索完成回调"""
-        self.progress_bar.setVisible(False)
+        progress = getattr(self, "搜索结果_progress")
+        progress.setVisible(False)
         self.statusBar().showMessage(f"搜索完成，找到 {len(results)} 个结果")
         
         # 更新标题
-        self.search_title.setText(f"搜索结果 ({len(results)})")
+        title = getattr(self, "搜索结果_title")
+        title.setText(f"搜索结果: {keyword} ({len(results)})")
         
         # 显示搜索结果
-        row, col = 0, 0
-        max_cols = 3  # 每行最多3个视频卡片
+        grid = getattr(self, "搜索结果_grid")
+        self.displayVideosInGrid(results, grid)
         
-        for video_info in results:
-            if 'bvid' in video_info and 'title' in video_info:
-                video_card = VideoCard(video_info)
-                self.search_layout.addWidget(video_card, row, col)
-                
-                col += 1
-                if col >= max_cols:
-                    col = 0
-                    row += 1
-                    
         # 切换到搜索结果选项卡
         self.tab_widget.setCurrentWidget(self.search_tab)
         
     def onSearchError(self, error_msg: str):
         """搜索错误回调"""
-        self.progress_bar.setVisible(False)
+        progress = getattr(self, "搜索结果_progress")
+        progress.setVisible(False)
         self.statusBar().showMessage("搜索失败")
         QMessageBox.critical(self, "搜索错误", f"搜索失败: {error_msg}")
+    
+    def loadRecommendVideos(self):
+        """加载推荐视频"""
+        progress = getattr(self, "推荐_progress")
+        progress.setVisible(True)
+        progress.setRange(0, 0)
+        self.statusBar().showMessage("正在加载推荐视频...")
+        
+        worker = RecommendVideosWorker()
+        worker.finished.connect(self.onRecommendVideosLoaded)
+        worker.error.connect(lambda e: self.onContentLoadError("推荐", e))
+        worker.start()
+        
+        # 保存worker引用避免被垃圾回收
+        self.recommend_worker = worker
+        
+    def onRecommendVideosLoaded(self, videos: list):
+        """推荐视频加载完成"""
+        progress = getattr(self, "推荐_progress")
+        progress.setVisible(False)
+        self.statusBar().showMessage(f"推荐视频加载完成，共 {len(videos)} 个")
+        
+        title = getattr(self, "推荐_title")
+        title.setText(f"推荐 ({len(videos)})")
+        
+        grid = getattr(self, "推荐_grid")
+        self.clearGrid(grid)
+        self.displayVideosInGrid(videos, grid)
+        
+    def loadHotVideos(self):
+        """加载热门视频"""
+        progress = getattr(self, "热门_progress")
+        progress.setVisible(True)
+        progress.setRange(0, 0)
+        self.statusBar().showMessage("正在加载热门视频...")
+        
+        worker = HotVideosWorker()
+        worker.finished.connect(self.onHotVideosLoaded)
+        worker.error.connect(lambda e: self.onContentLoadError("热门", e))
+        worker.start()
+        
+        self.hot_worker = worker
+        
+    def onHotVideosLoaded(self, videos: list):
+        """热门视频加载完成"""
+        progress = getattr(self, "热门_progress")
+        progress.setVisible(False)
+        self.statusBar().showMessage(f"热门视频加载完成，共 {len(videos)} 个")
+        
+        title = getattr(self, "热门_title")
+        title.setText(f"热门 ({len(videos)})")
+        
+        grid = getattr(self, "热门_grid")
+        self.clearGrid(grid)
+        self.displayVideosInGrid(videos, grid)
+        
+    def loadLiveRooms(self):
+        """加载直播间"""
+        progress = getattr(self, "直播_progress")
+        progress.setVisible(True)
+        progress.setRange(0, 0)
+        self.statusBar().showMessage("正在加载直播间...")
+        
+        worker = LiveRoomsWorker()
+        worker.finished.connect(self.onLiveRoomsLoaded)
+        worker.error.connect(lambda e: self.onContentLoadError("直播", e))
+        worker.start()
+        
+        self.live_worker = worker
+        
+    def onLiveRoomsLoaded(self, rooms: list):
+        """直播间加载完成"""
+        progress = getattr(self, "直播_progress")
+        progress.setVisible(False)
+        self.statusBar().showMessage(f"直播间加载完成，共 {len(rooms)} 个")
+        
+        title = getattr(self, "直播_title")
+        title.setText(f"直播 ({len(rooms)})")
+        
+        grid = getattr(self, "直播_grid")
+        self.clearGrid(grid)
+        self.displayVideosInGrid(rooms, grid, is_live=True)
+        
+    def onContentLoadError(self, content_type: str, error_msg: str):
+        """内容加载错误"""
+        progress = getattr(self, f"{content_type}_progress")
+        progress.setVisible(False)
+        self.statusBar().showMessage(f"{content_type}加载失败")
+        QMessageBox.warning(self, "加载错误", f"{content_type}加载失败: {error_msg}")
+        
+    def refreshTab(self, tab_name: str):
+        """刷新选项卡内容"""
+        if tab_name == "推荐":
+            self.loadRecommendVideos()
+        elif tab_name == "热门":
+            self.loadHotVideos()
+        elif tab_name == "直播":
+            self.loadLiveRooms()
+        elif tab_name == "搜索结果":
+            self.search()
+            
+    def onVideoCardClicked(self, video_info: dict):
+        """视频卡片点击事件"""
+        bvid = video_info.get('bvid', '') or video_info.get('id', '')
+        if not bvid:
+            # 尝试从aid获取bvid
+            aid = video_info.get('aid', 0)
+            if aid:
+                try:
+                    bvid = bilibili_api.bvid2aid(aid)
+                except:
+                    pass
+        
+        if bvid:
+            # 显示视频详情对话框
+            dialog = VideoDetailDialog(video_info, self)
+            dialog.exec()
+        else:
+            QMessageBox.information(self, "提示", "无法获取视频信息")
+            
+    def onLiveRoomClicked(self, room_info: dict):
+        """直播间卡片点击事件"""
+        room_id = room_info.get('roomid', '') or room_info.get('room_id', '')
+        if room_id:
+            url = f"https://live.bilibili.com/{room_id}"
+            QDesktopServices.openUrl(QUrl(url))
+        else:
+            QMessageBox.information(self, "提示", "无法获取直播间信息")
         
     def showLoginDialog(self):
         """显示登录对话框"""
         dialog = LoginDialog()
+        dialog.login_success.connect(self.onLoginSuccess)
         dialog.show()
+        
+        # 保存引用避免被垃圾回收
+        self.login_dialog = dialog
+        
+    def onLoginSuccess(self, credential: Credential):
+        """登录成功回调"""
+        self.credential = credential
+        self.user_name.setText("已登录")
+        self.statusBar().showMessage("登录成功")
         
     def logout(self):
         """登出"""
@@ -475,10 +1049,17 @@ class BilibiliClient(QMainWindow):
         self.statusBar().showMessage("已登出")
         
     def refresh(self):
-        """刷新内容"""
-        self.statusBar().showMessage("刷新中...")
-        # 这里可以添加刷新逻辑
-        QTimer.singleShot(1000, lambda: self.statusBar().showMessage("刷新完成"))
+        """刷新当前选项卡内容"""
+        current_tab = self.tab_widget.currentWidget()
+        if current_tab == self.recommend_tab:
+            self.loadRecommendVideos()
+        elif current_tab == self.hot_tab:
+            self.loadHotVideos()
+        elif current_tab == self.live_tab:
+            self.loadLiveRooms()
+        elif current_tab == self.search_tab:
+            if hasattr(self, 'search_worker') and self.search_worker:
+                self.search()
         
     def showAbout(self):
         """显示关于信息"""
@@ -488,27 +1069,45 @@ class BilibiliClient(QMainWindow):
             f"Bilibili 第三方客户端\n\n"
             f"基于 bilibili-api {bilibili_api.BILIBILI_API_VERSION}\n"
             f"使用 PyQt6 和 Material Design\n\n"
+            f"功能特性：\n"
+            f"• 视频搜索和浏览\n"
+            f"• 推荐视频展示\n"
+            f"• 热门视频展示\n"
+            f"• 直播间浏览\n"
+            f"• 视频详情查看\n\n"
             f"仅供学习和测试使用"
         )
         
     # 导航按钮回调函数
     def showHome(self):
-        self.statusBar().showMessage("首页功能开发中...")
+        """显示首页"""
+        self.tab_widget.setCurrentWidget(self.recommend_tab)
+        if not hasattr(self, 'recommend_worker') or not self.recommend_worker:
+            self.loadRecommendVideos()
         
     def showHot(self):
-        self.statusBar().showMessage("热门功能开发中...")
+        """显示热门"""
+        self.tab_widget.setCurrentWidget(self.hot_tab)
+        if not hasattr(self, 'hot_worker') or not self.hot_worker:
+            self.loadHotVideos()
         
     def showLive(self):
-        self.statusBar().showMessage("直播功能开发中...")
+        """显示直播"""
+        self.tab_widget.setCurrentWidget(self.live_tab)
+        if not hasattr(self, 'live_worker') or not self.live_worker:
+            self.loadLiveRooms()
         
     def showMusic(self):
-        self.statusBar().showMessage("音乐功能开发中...")
+        """显示音乐"""
+        self.statusBar().showMessage("音乐功能即将推出...")
         
     def showArticle(self):
-        self.statusBar().showMessage("专栏功能开发中...")
+        """显示专栏"""
+        self.statusBar().showMessage("专栏功能即将推出...")
         
     def showGame(self):
-        self.statusBar().showMessage("游戏功能开发中...")
+        """显示游戏"""
+        self.statusBar().showMessage("游戏功能即将推出...")
         
 
 def main():
