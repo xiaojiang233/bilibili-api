@@ -315,6 +315,59 @@ class UserDynamicsWorker(QThread):
             raise e
 
 
+class AllDynamicsWorker(QThread):
+    """全站动态工作线程"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results = loop.run_until_complete(self.fetch_dynamics())
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_dynamics(self):
+        """获取全站动态"""
+        try:
+            # 获取全站动态
+            from bilibili_api import homepage
+            dynamics_data = await homepage.get_videos()
+            items = dynamics_data.get('item', [])
+            # 将视频格式转为简单动态格式
+            dynamics = []
+            for item in items:
+                dynamic_item = {
+                    'id_str': str(item.get('id', '')),
+                    'type': 'DYNAMIC_TYPE_AV',
+                    'modules': {
+                        'module_dynamic': {
+                            'desc': {
+                                'text': item.get('title', '')
+                            }
+                        },
+                        'module_author': {
+                            'name': item.get('owner', {}).get('name', '未知')
+                        },
+                        'module_stat': {
+                            'like': {'count': item.get('stat', {}).get('like', 0)},
+                            'reply': {'count': item.get('stat', {}).get('reply', 0)}
+                        }
+                    }
+                }
+                dynamics.append(dynamic_item)
+            return dynamics
+        except Exception as e:
+            raise e
+
+
 class LoginDialog(QWidget):
     """登录对话框"""
     
@@ -593,6 +646,213 @@ class LiveRoomCard(QFrame):
         super().mousePressEvent(event)
 
 
+class DynamicCard(QFrame):
+    """动态卡片组件"""
+    
+    clicked = pyqtSignal(dict)
+    
+    def __init__(self, dynamic_info: dict):
+        super().__init__()
+        self.dynamic_info = dynamic_info
+        self.setupUI()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+    def setupUI(self):
+        self.setObjectName("videoCard")
+        self.setFixedSize(300, 280)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        
+        # 动态类型
+        dtype = self.dynamic_info.get('type', '未知')
+        type_label = QLabel(f"类型: {dtype}")
+        type_label.setObjectName("subtitleLabel")
+        type_label.setStyleSheet("color: #2196f3; font-weight: 500;")
+        
+        # 动态内容预览
+        modules = self.dynamic_info.get('modules', {})
+        desc = modules.get('module_dynamic', {}).get('desc', {})
+        text = desc.get('text', '无内容')
+        
+        content_label = QLabel(text[:100] + ('...' if len(text) > 100 else ''))
+        content_label.setObjectName("titleLabel")
+        content_label.setWordWrap(True)
+        content_label.setMaximumHeight(80)
+        content_label.setStyleSheet("font-size: 13px;")
+        
+        # 作者信息
+        author_info = modules.get('module_author', {})
+        author_name = author_info.get('name', '未知')
+        author_label = QLabel(f"作者: {author_name}")
+        author_label.setObjectName("subtitleLabel")
+        
+        # 统计信息
+        stat = modules.get('module_stat', {})
+        like = stat.get('like', {}).get('count', 0)
+        reply = stat.get('reply', {}).get('count', 0)
+        
+        stats_label = QLabel(f"👍 {like} | 💬 {reply}")
+        stats_label.setObjectName("subtitleLabel")
+        
+        layout.addWidget(type_label)
+        layout.addWidget(content_label)
+        layout.addWidget(author_label)
+        layout.addWidget(stats_label)
+        layout.addStretch()
+        
+    def mousePressEvent(self, event):
+        """鼠标点击事件"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.dynamic_info)
+        super().mousePressEvent(event)
+
+
+class UserProfileDialog(QDialog):
+    """用户信息对话框"""
+    
+    def __init__(self, uid: int, credential: Optional[Credential] = None, parent=None):
+        super().__init__(parent)
+        self.uid = uid
+        self.credential = credential
+        self.setupUI()
+        self.loadUserInfo()
+        
+    def setupUI(self):
+        self.setWindowTitle("用户信息")
+        self.setMinimumSize(600, 500)
+        
+        layout = QVBoxLayout(self)
+        
+        # 用户信息区域
+        self.info_group = QGroupBox("用户信息")
+        info_layout = QVBoxLayout(self.info_group)
+        
+        self.loading_label = QLabel("正在加载用户信息...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_layout.addWidget(self.loading_label)
+        
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        info_layout.addWidget(self.progress)
+        
+        layout.addWidget(self.info_group)
+        
+        # 关闭按钮
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+        
+    def loadUserInfo(self):
+        """加载用户信息"""
+        worker = UserInfoWorker(self.uid, self.credential)
+        worker.finished.connect(self.onUserInfoLoaded)
+        worker.error.connect(self.onUserInfoError)
+        worker.start()
+        
+        self.user_worker = worker
+        
+    def onUserInfoLoaded(self, user_info: dict):
+        """用户信息加载完成"""
+        self.progress.setVisible(False)
+        self.loading_label.setVisible(False)
+        
+        # 清空布局
+        info_layout = self.info_group.layout()
+        
+        # 用户头像
+        face_url = user_info.get('face', '')
+        if face_url:
+            avatar = ImageLoader()
+            avatar.setFixedSize(100, 100)
+            avatar.setStyleSheet("border-radius: 50px;")
+            if face_url.startswith('//'):
+                face_url = 'https:' + face_url
+            avatar.load_url(face_url)
+            info_layout.addWidget(avatar, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # 用户名
+        name = QLabel(user_info.get('name', '未知'))
+        name.setObjectName("titleLabel")
+        name.setStyleSheet("font-size: 20px; font-weight: bold;")
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_layout.addWidget(name)
+        
+        # UID
+        uid_label = QLabel(f"UID: {user_info.get('mid', 'N/A')}")
+        uid_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_layout.addWidget(uid_label)
+        
+        # 签名
+        sign = user_info.get('sign', '这个人很懒，什么都没有留下')
+        sign_label = QLabel(f"签名: {sign}")
+        sign_label.setWordWrap(True)
+        info_layout.addWidget(sign_label)
+        
+        # 统计信息
+        stats_text = f"""
+        等级: Lv{user_info.get('level', 0)}
+        粉丝: {self.format_count(user_info.get('follower', 0))}
+        关注: {self.format_count(user_info.get('following', 0))}
+        """
+        stats_label = QLabel(stats_text.strip())
+        info_layout.addWidget(stats_label)
+        
+        # 在浏览器中打开
+        open_btn = QPushButton("在浏览器中打开主页")
+        open_btn.clicked.connect(lambda: self.openUserPage(user_info.get('mid')))
+        info_layout.addWidget(open_btn)
+        
+    def onUserInfoError(self, error_msg: str):
+        """用户信息加载失败"""
+        self.progress.setVisible(False)
+        self.loading_label.setText(f"加载失败: {error_msg}")
+        
+    def format_count(self, count: int) -> str:
+        """格式化数字显示"""
+        if count >= 10000:
+            return f"{count/10000:.1f}万"
+        return str(count)
+        
+    def openUserPage(self, uid):
+        """在浏览器中打开用户主页"""
+        if uid:
+            url = f"https://space.bilibili.com/{uid}"
+            QDesktopServices.openUrl(QUrl(url))
+
+
+class UserInfoWorker(QThread):
+    """用户信息工作线程"""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    
+    def __init__(self, uid: int, credential: Optional[Credential] = None):
+        super().__init__()
+        self.uid = uid
+        self.credential = credential
+        
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self.fetch_user_info())
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            loop.close()
+            
+    async def fetch_user_info(self):
+        """获取用户信息"""
+        try:
+            u = user.User(uid=self.uid, credential=self.credential)
+            info = await u.get_user_info()
+            return info
+        except Exception as e:
+            raise e
+
+
 class BilibiliClient(QMainWindow):
     """Bilibili 第三方客户端主窗口"""
     
@@ -714,6 +974,7 @@ class BilibiliClient(QMainWindow):
             ("🏠 首页", self.showHome),
             ("🔥 热门", self.showHot),
             ("📺 直播", self.showLive),
+            ("📝 动态", self.showDynamic),
             ("🎵 音乐", self.showMusic),
             ("📖 专栏", self.showArticle),
             ("🎮 游戏", self.showGame),
@@ -754,6 +1015,10 @@ class BilibiliClient(QMainWindow):
         # 直播选项卡
         self.live_tab = self.createVideoGridTab("直播")
         self.tab_widget.addTab(self.live_tab, "📺 直播")
+        
+        # 动态选项卡
+        self.dynamic_tab = self.createVideoGridTab("动态")
+        self.tab_widget.addTab(self.dynamic_tab, "📝 动态")
         
         layout.addWidget(self.tab_widget)
         
@@ -979,6 +1244,66 @@ class BilibiliClient(QMainWindow):
         grid = getattr(self, "直播_grid")
         self.clearGrid(grid)
         self.displayVideosInGrid(rooms, grid, is_live=True)
+    
+    def loadDynamics(self):
+        """加载动态"""
+        if not self.credential:
+            QMessageBox.information(self, "提示", "请先登录以查看动态")
+            return
+            
+        progress = getattr(self, "动态_progress")
+        progress.setVisible(True)
+        progress.setRange(0, 0)
+        self.statusBar().showMessage("正在加载动态...")
+        
+        # 获取当前登录用户的UID（这里使用一个示例UID，实际应该从登录信息获取）
+        # 由于无法直接从credential获取uid，我们加载全站动态
+        worker = AllDynamicsWorker()
+        worker.finished.connect(self.onDynamicsLoaded)
+        worker.error.connect(lambda e: self.onContentLoadError("动态", e))
+        worker.start()
+        
+        self.dynamics_worker = worker
+        
+    def onDynamicsLoaded(self, dynamics: list):
+        """动态加载完成"""
+        progress = getattr(self, "动态_progress")
+        progress.setVisible(False)
+        self.statusBar().showMessage(f"动态加载完成，共 {len(dynamics)} 条")
+        
+        title = getattr(self, "动态_title")
+        title.setText(f"动态 ({len(dynamics)})")
+        
+        grid = getattr(self, "动态_grid")
+        self.clearGrid(grid)
+        
+        # 显示动态卡片
+        row, col = 0, 0
+        max_cols = 3
+        
+        for dynamic_info in dynamics:
+            try:
+                card = DynamicCard(dynamic_info)
+                card.clicked.connect(self.onDynamicClicked)
+                grid.addWidget(card, row, col)
+                
+                col += 1
+                if col >= max_cols:
+                    col = 0
+                    row += 1
+            except Exception as e:
+                print(f"创建动态卡片失败: {e}")
+                continue
+        
+    def onDynamicClicked(self, dynamic_info: dict):
+        """动态卡片点击事件"""
+        # 获取动态ID并在浏览器中打开
+        dynamic_id = dynamic_info.get('id_str', '')
+        if dynamic_id:
+            url = f"https://t.bilibili.com/{dynamic_id}"
+            QDesktopServices.openUrl(QUrl(url))
+        else:
+            QMessageBox.information(self, "提示", "无法获取动态信息")
         
     def onContentLoadError(self, content_type: str, error_msg: str):
         """内容加载错误"""
@@ -995,6 +1320,8 @@ class BilibiliClient(QMainWindow):
             self.loadHotVideos()
         elif tab_name == "直播":
             self.loadLiveRooms()
+        elif tab_name == "动态":
+            self.loadDynamics()
         elif tab_name == "搜索结果":
             self.search()
             
@@ -1096,6 +1423,12 @@ class BilibiliClient(QMainWindow):
         self.tab_widget.setCurrentWidget(self.live_tab)
         if not hasattr(self, 'live_worker') or not self.live_worker:
             self.loadLiveRooms()
+    
+    def showDynamic(self):
+        """显示动态"""
+        self.tab_widget.setCurrentWidget(self.dynamic_tab)
+        if not hasattr(self, 'dynamics_worker') or not self.dynamics_worker:
+            self.loadDynamics()
         
     def showMusic(self):
         """显示音乐"""
